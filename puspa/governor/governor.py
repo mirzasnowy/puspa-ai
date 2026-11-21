@@ -68,6 +68,15 @@ whether to act or ask (K2 owns that). The live turn loop does
 not consult the governor yet: the loop cannot branch on depth
 until the router maps depths to model tiers, so that wiring
 lands with the tier mapping, not here.
+
+Thinking budgets (V2-14): every decided step also gets a
+per-task budget sized by its stakes plus a hard wall-clock
+cap (:meth:`DepthGovernor.thinking_budget`). When the cap
+hits mid-task the turn reports progress — done, remaining,
+next — and continues under a fresh slice, never going silent.
+See :mod:`puspa.governor.budgets` for the sizing and the
+:func:`run_capped_task <puspa.governor.budgets.run_capped_task>`
+call site.
 """
 
 from __future__ import annotations
@@ -75,8 +84,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from .skills import CompiledSkill, InMemorySkillStore, RegressionCase, SkillStore
+
+if TYPE_CHECKING:
+    from .budgets import ThinkingBudget
 
 __all__ = [
     "COMPILE_AFTER_SUCCESSES",
@@ -212,10 +225,25 @@ class DepthGovernor:
     reflex_max_uncertainty: float = REFLEX_MAX_UNCERTAINTY
     deep_risk: float = DEEP_RISK
     deep_min_stakes_irreversible: float = DEEP_MIN_STAKES_IRREVERSIBLE
+    # Multipliers on the thinking budget a decided step gets
+    # (:meth:`thinking_budget`): 1.0 leaves the stakes-scaled
+    # defaults alone; the governor owns them like any other
+    # threshold, so traces can tune them without touching the
+    # budget module.
+    thinking_step_scale: float = 1.0
+    thinking_time_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.compile_after < 1:
             raise ValueError(f"compile_after must be at least 1, got {self.compile_after}")
+        if self.thinking_step_scale <= 0:
+            raise ValueError(
+                f"thinking_step_scale must be positive, got {self.thinking_step_scale}"
+            )
+        if self.thinking_time_scale <= 0:
+            raise ValueError(
+                f"thinking_time_scale must be positive, got {self.thinking_time_scale}"
+            )
         self._deep_successes: dict[str, int] = {}
 
     # -- picking -------------------------------------------------------
@@ -291,6 +319,39 @@ class DepthGovernor:
             depth=Depth.DELIBERATE,
             reason="default depth: no skill match, risk below the deep bar",
             risk=risk,
+        )
+
+    def thinking_budget(
+        self,
+        signal: StepSignal,
+        decision: DepthDecision,
+        *,
+        max_steps: int | None = None,
+        wall_clock_seconds: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> ThinkingBudget:
+        """Build the per-task thinking budget for a decided step.
+
+        The budget is sized by the signal's stakes and the
+        depth this governor just decided — a deep step gets
+        the deep allowance, a reflex step the reflex one, and
+        higher stakes stretch both. ``max_steps`` and
+        ``wall_clock_seconds`` override the scaled defaults
+        when given (a deep step with a deliberately small
+        budget, so the cap fires and the turn reports progress
+        instead of going silent). ``clock`` is injected for
+        tests; the default is the monotonic clock.
+        """
+        from .budgets import ThinkingBudget
+
+        return ThinkingBudget(
+            stakes=signal.stakes,
+            depth=decision.depth,
+            max_steps=max_steps,
+            wall_clock_seconds=wall_clock_seconds,
+            step_scale=self.thinking_step_scale,
+            time_scale=self.thinking_time_scale,
+            clock=clock,
         )
 
     def find_skill(self, task_key: str) -> CompiledSkill | None:

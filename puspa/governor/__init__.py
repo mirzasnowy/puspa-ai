@@ -11,6 +11,16 @@ stores.
 
 from __future__ import annotations
 
+from .budgets import (
+    MAX_THINKING_SECONDS,
+    MAX_THINKING_STEPS,
+    THINKING_SECONDS,
+    THINKING_STEPS,
+    CappedTaskResult,
+    ProgressReport,
+    ThinkingBudget,
+    run_capped_task,
+)
 from .governor import (
     COMPILE_AFTER_SUCCESSES,
     DEEP_MIN_STAKES_IRREVERSIBLE,
@@ -38,17 +48,25 @@ __all__ = [
     "COMPILE_AFTER_SUCCESSES",
     "DEEP_MIN_STAKES_IRREVERSIBLE",
     "DEEP_RISK",
+    "MAX_THINKING_SECONDS",
+    "MAX_THINKING_STEPS",
     "REFLEX_MAX_STAKES",
     "REFLEX_MAX_UNCERTAINTY",
     "REFLEX_SKILL_MATCH",
+    "THINKING_SECONDS",
+    "THINKING_STEPS",
+    "CappedTaskResult",
     "CompiledSkill",
     "Depth",
     "DepthDecision",
     "DepthGovernor",
     "InMemorySkillStore",
     "ProceduralSkillStore",
+    "ProgressReport",
     "RegressionCase",
     "RegressionResult",
     "SkillStore",
     "StepSignal",
+    "ThinkingBudget",
+    "run_capped_task",
 ]
