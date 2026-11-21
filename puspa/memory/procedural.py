@@ -199,6 +199,55 @@ def detect_contradiction(existing_procedures, service, step_new):
     return None
 
 
+def insert_procedure(
+    user_id,
+    service,
+    step,
+    *,
+    version=1,
+    agent_id=None,
+    output_schema=None,
+    required_checks=None,
+    source_event_id=None,
+    dsn=None,
+):
+    """Insert a NEW procedure row for a service, even when one exists.
+
+    Unlike :func:`record_successful_task`, this never folds the
+    write into an existing row: it always creates a fresh trial
+    procedure with ``version`` and 1 successful run. The skill
+    compiler uses it to store a repaired or re-generalised skill
+    as a new version; the older rows stay as history and are
+    never silently overwritten.
+    """
+    if not service or not isinstance(step, list) or not step:
+        raise ValueError("service and non-empty steps are required")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ValueError(f"procedure version must be an integer at least 1, got {version!r}")
+    with _connect(dsn) as conn:
+        with conn.cursor() as cur:
+            agent_ids = [str(agent_id)] if agent_id else []
+            cur.execute(
+                "INSERT INTO procedures (user_id, service, versi, step, "
+                "output_schema, required_checks, status, successful_runs, "
+                "agent_ids, source_event_id) VALUES (%s, %s, %s, %s, %s, %s, "
+                "'trial', 1, %s, %s) RETURNING *",
+                (
+                    user_id,
+                    service,
+                    version,
+                    Jsonb(step),
+                    Jsonb(output_schema or {}),
+                    Jsonb(required_checks or []),
+                    Jsonb(agent_ids),
+                    source_event_id,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_procedure(row)
+
+
 def record_successful_task(
     user_id,
     service,

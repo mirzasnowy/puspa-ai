@@ -56,10 +56,14 @@ count reaches the compile bar it builds the skill candidate,
 runs its regression case, and stores it only when the regression
 passes. A stored skill is then matched by :meth:`decide` on the
 next similar task, so the step runs as reflex — deep once,
-reflex afterwards. The full skill compiler (generalising plans
-into reusable skills) is a later item (V2-13); the governor
-only needs this hook, and the hook only compiles the exact
-steps that succeeded, with their regression case attached.
+reflex afterwards. With a skill compiler attached (V2-13,
+:mod:`puspa.governor.compiler`), the governor generalises the
+streak's runs into a versioned skill instead of storing the
+exact steps: differing arguments become parameters, invariant
+outcomes become postconditions, and the compiled skill replays
+in the sandbox before it is stored. Without a compiler the hook
+keeps its original behaviour — it compiles the exact steps that
+succeeded, with their regression case attached.
 
 What the governor does NOT decide: which model tier runs a
 depth (the router owns that), whether the step may run at all
@@ -76,6 +80,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from .compiler import SkillCompiler, SkillRun
 from .skills import CompiledSkill, InMemorySkillStore, RegressionCase, SkillStore
 
 __all__ = [
@@ -201,11 +206,17 @@ class DepthGovernor:
     ``skill_store`` is where compiled skills live (default: an
     in-memory store; pass :class:`ProceduralSkillStore
     <puspa.governor.skills.ProceduralSkillStore>` for the durable
-    one). The remaining arguments are the thresholds from the
-    module docstring — initial values to tune from traces.
+    one). ``compiler`` is the V2-13 skill compiler
+    (:class:`SkillCompiler <puspa.governor.compiler.SkillCompiler>`);
+    when it is set, :meth:`record_outcome` generalises the
+    streak's runs into a versioned skill through it, and the
+    compiler must share this governor's skill store. The
+    remaining arguments are the thresholds from the module
+    docstring — initial values to tune from traces.
     """
 
     skill_store: SkillStore = field(default_factory=InMemorySkillStore)
+    compiler: SkillCompiler | None = None
     compile_after: int = COMPILE_AFTER_SUCCESSES
     reflex_skill_match: float = REFLEX_SKILL_MATCH
     reflex_max_stakes: float = REFLEX_MAX_STAKES
@@ -217,6 +228,7 @@ class DepthGovernor:
         if self.compile_after < 1:
             raise ValueError(f"compile_after must be at least 1, got {self.compile_after}")
         self._deep_successes: dict[str, int] = {}
+        self._runs: dict[str, list[SkillRun]] = {}
 
     # -- picking -------------------------------------------------------
 
@@ -345,33 +357,47 @@ class DepthGovernor:
         regression: RegressionCase | None = None,
         step_runner: Callable[[dict], dict] | None = None,
         agent_id: str | None = None,
+        last_result: dict | None = None,
     ) -> CompiledSkill | None:
         """Record one step outcome; compile the task when its deep streak fills.
 
         Only a succeeded deep step counts. A failure resets the
-        streak for the key; a deliberate or reflex success leaves
-        it alone. When the streak reaches ``compile_after`` the
-        governor builds the skill candidate from ``steps`` and
-        ``regression`` and runs the regression through
-        ``step_runner`` — the skill is stored only when the
-        regression passes, and only then is the streak reset and
-        the stored skill returned. Anything missing (no steps, no
-        regression case, no runner) or a failed regression returns
-        None and stores nothing; the streak stays full so a later
-        call with the missing pieces can still compile.
+        streak for the key (and drops the runs stashed for it);
+        a deliberate or reflex success leaves it alone. When the
+        streak reaches ``compile_after`` the governor compiles
+        the task: with a compiler attached, it generalises the
+        streak's runs — each call's ``steps`` plus its
+        ``last_result`` (the observed result of the run's last
+        step) — into a versioned skill and stores it only when
+        its replay passes. Without a compiler it builds the
+        skill candidate from ``steps`` and ``regression`` and
+        runs the regression through ``step_runner`` — the skill
+        is stored only when the regression passes, and only
+        then is the streak reset and the stored skill returned.
+        Anything missing (no steps, no regression case, no
+        runner) or a failed regression returns None and stores
+        nothing; the streak stays full so a later call with the
+        missing pieces can still compile.
         """
         if not task_key or not isinstance(task_key, str):
             raise ValueError("recording an outcome needs a non-empty task key")
         run_depth = depth if isinstance(depth, Depth) else Depth(depth)
         if not succeeded:
             self._deep_successes[task_key] = 0
+            self._runs.pop(task_key, None)
             return None
         if run_depth is not Depth.DEEP:
             return None
         count = self._deep_successes.get(task_key, 0) + 1
         self._deep_successes[task_key] = count
+        if steps is not None:
+            self._runs.setdefault(task_key, []).append(
+                SkillRun(steps=list(steps), last_result=dict(last_result) if last_result else {})
+            )
         if count < self.compile_after:
             return None
+        if self.compiler is not None:
+            return self._compile_with_compiler(task_key, step_runner=step_runner, agent_id=agent_id)
         if not steps or regression is None or step_runner is None:
             return None
         candidate = CompiledSkill(task_key=task_key, steps=list(steps), regression=regression)
@@ -381,3 +407,30 @@ class DepthGovernor:
         stored = self.skill_store.save(candidate, agent_id=agent_id)
         self._deep_successes[task_key] = 0
         return stored
+
+    def _compile_with_compiler(
+        self,
+        task_key: str,
+        *,
+        step_runner: Callable[[dict], dict] | None,
+        agent_id: str | None,
+    ) -> CompiledSkill | None:
+        """Compile the streak's runs through the attached compiler.
+
+        Returns the stored skill, or None when the streak holds
+        no runs or the compiler could not produce a passing
+        skill — the streak stays full either way, so a later
+        success can still compile.
+        """
+        compiler = self.compiler
+        if compiler is None:
+            return None
+        runs = self._runs.get(task_key, [])
+        if not runs:
+            return None
+        result = compiler.compile(task_key, runs, step_runner=step_runner, agent_id=agent_id)
+        if result.skill is None:
+            return None
+        self._deep_successes[task_key] = 0
+        self._runs.pop(task_key, None)
+        return result.skill
